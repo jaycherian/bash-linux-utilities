@@ -1,0 +1,270 @@
+#!/bin/bash
+# Exit immediately if a pipeline fails
+set -e
+
+echo "======================================================"
+echo "      Interactive GCP VM Provisioning Script"
+echo "======================================================"
+
+# 1. Project Configuration
+CURRENT_PROJECT=$(gcloud config get-value project 2>/dev/null)
+if [ -z "$CURRENT_PROJECT" ]; then
+    read -p "No default GCP project found. Enter target Project ID: " PROJECT_ID
+    gcloud config set project "$PROJECT_ID"
+else
+    read -p "Current project is '$CURRENT_PROJECT'. Use this project? [Y/n]: " CONFIRM_PROJ
+    CONFIRM_PROJ=${CONFIRM_PROJ:-Y}
+    if [[ "$CONFIRM_PROJ" =~ ^[Yy]$ ]]; then
+        PROJECT_ID=$CURRENT_PROJECT
+    else
+        read -p "Enter the target GCP Project ID: " PROJECT_ID
+        gcloud config set project "$PROJECT_ID"
+    fi
+fi
+
+# Dynamically fetch the default Compute Engine service account for the selected project
+PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)")
+SERVICE_ACCOUNT="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+
+# 2. VM Name (Enforce non-empty input)
+VM_NAME=""
+while [ -z "$VM_NAME" ]; do
+    read -p "Enter a name for the new VM instance: " VM_NAME
+done
+
+# 3. Zone and Region (Add default fallback)
+read -p "Enter the target Zone [default: us-central1-b]: " ZONE
+ZONE=${ZONE:-us-central1-b}
+# Extract region from zone (e.g., us-central1-b -> us-central1)
+REGION=$(echo "$ZONE" | rev | cut -d'-' -f2- | rev)
+
+# 4. Machine Shape
+echo -e "\nFetching common machine shapes..."
+read -p "Enter Machine Type [default: n1-standard-32]: " MACHINE_TYPE
+MACHINE_TYPE=${MACHINE_TYPE:-n1-standard-32}
+
+# 5. Accelerators (TPUs/GPUs) - Selectable Menu
+echo -e "\nPlease select an Accelerator Type:"
+ACCEL_OPTIONS=("none" "nvidia-tesla-t4" "nvidia-tesla-a100" "nvidia-tesla-v100" "v2-8 (TPU)" "Custom/Other")
+select ACCEL_CHOICE in "${ACCEL_OPTIONS[@]}"; do
+    case $ACCEL_CHOICE in
+        "none")
+            ACCEL_TYPE="none"
+            break
+            ;;
+        "Custom/Other")
+            read -p "Enter custom accelerator type: " ACCEL_TYPE
+            break
+            ;;
+        *)
+            if [ -n "$ACCEL_CHOICE" ]; then
+                # Strip the "(TPU)" text if it exists to get the pure hardware type
+                ACCEL_TYPE=$(echo "$ACCEL_CHOICE" | awk '{print $1}')
+                break
+            else
+                echo "Invalid selection. Please enter a number."
+            fi
+            ;;
+    esac
+done
+
+if [ "$ACCEL_TYPE" != "none" ]; then
+    read -p "Enter Accelerator Count [default: 1]: " ACCEL_COUNT
+    ACCEL_COUNT=${ACCEL_COUNT:-1}
+    # Create the flag string to be injected into the gcloud command later
+    ACCEL_FLAG="--accelerator=count=$ACCEL_COUNT,type=$ACCEL_TYPE"
+else
+    ACCEL_FLAG=""
+fi
+
+# 6. VPC Network Selection & Creation Logic
+echo -e "\nFetching available VPC Networks in project '$PROJECT_ID'..."
+readarray -t NETWORKS < <(gcloud compute networks list --format="value(name)" --project="$PROJECT_ID")
+
+NETWORK_OPTIONS=("${NETWORKS[@]}" "Create a NEW VPC Network")
+
+echo "Please select a VPC Network to install the VM in:"
+select NETWORK_ACTION in "${NETWORK_OPTIONS[@]}"; do
+    if [ -n "$NETWORK_ACTION" ]; then
+        if [[ "$NETWORK_ACTION" == "Create a NEW VPC Network" ]]; then
+            NETWORK_NAME=""
+            while [ -z "$NETWORK_NAME" ]; do
+                read -p "Enter a name for the new VPC Network: " NETWORK_NAME
+            done
+            echo "Creating custom VPC network '$NETWORK_NAME'..."
+            gcloud compute networks create "$NETWORK_NAME" \
+                --subnet-mode=custom \
+                --project="$PROJECT_ID"
+            break
+        else
+            NETWORK_NAME="$NETWORK_ACTION"
+            echo "Selected Network: $NETWORK_NAME"
+            break
+        fi
+    else
+        echo "Invalid selection. Please enter a valid number."
+    fi
+done
+
+# 7. Subnet Selection & Creation Logic
+echo -e "\nFetching subnets for network '$NETWORK_NAME' in region '$REGION'..."
+readarray -t SUBNETS < <(gcloud compute networks subnets list --network="$NETWORK_NAME" --filter="region:($REGION)" --format="value(name)" --project="$PROJECT_ID")
+
+SUBNET_OPTIONS=()
+if [ ${#SUBNETS[@]} -gt 0 ]; then
+    SUBNET_OPTIONS=("${SUBNETS[@]}")
+fi
+
+# Fetch subnets in OTHER regions for this network (if any exist)
+readarray -t OTHER_SUBNETS < <(gcloud compute networks subnets list --network="$NETWORK_NAME" --format="csv[no-heading](name,region.basename())" --project="$PROJECT_ID" | grep -v ",$REGION$" || true)
+if [ ${#OTHER_SUBNETS[@]} -gt 0 ]; then
+    for s in "${OTHER_SUBNETS[@]}"; do
+        if [ -n "$s" ]; then
+            SUBNET_OPTIONS+=("Switch to: $(echo "$s" | tr ',' ' ' | awk '{print $1 " (" $2 ")"}')")
+        fi
+    done
+fi
+
+SUBNET_OPTIONS+=("Create a NEW subnet in region: $REGION")
+
+echo "Please select a Subnet or an action:"
+select SUBNET_ACTION in "${SUBNET_OPTIONS[@]}"; do
+    if [ -n "$SUBNET_ACTION" ]; then
+        if [[ "$SUBNET_ACTION" == *"Create a NEW subnet"* ]]; then
+            NEW_SUBNET_NAME=""
+            while [ -z "$NEW_SUBNET_NAME" ]; do
+                read -p "Enter a name for the new subnet: " NEW_SUBNET_NAME
+            done
+            
+            IP_RANGE=""
+            while [ -z "$IP_RANGE" ]; do
+                read -p "Enter IP range for the subnet (e.g., 10.0.1.0/24): " IP_RANGE
+            done
+            
+            echo "Creating subnet '$NEW_SUBNET_NAME' in region '$REGION'..."
+            gcloud compute networks subnets create "$NEW_SUBNET_NAME" \
+                --network="$NETWORK_NAME" \
+                --region="$REGION" \
+                --range="$IP_RANGE" \
+                --project="$PROJECT_ID"
+            SUBNET_NAME="$NEW_SUBNET_NAME"
+            break
+        elif [[ "$SUBNET_ACTION" == *"Switch to:"* ]]; then
+            # Parse out the Subnet Name and the New Region
+            CHOSEN_SUBNET=$(echo "$SUBNET_ACTION" | awk '{print $3}')
+            CHOSEN_REGION=$(echo "$SUBNET_ACTION" | awk '{print $4}' | tr -d '()')
+            
+            echo -e "\nSwitched target Region to '$CHOSEN_REGION' using Subnet '$CHOSEN_SUBNET'."
+            REGION="$CHOSEN_REGION"
+            SUBNET_NAME="$CHOSEN_SUBNET"
+            
+            # If we change regions, the original Zone is invalid. Must prompt for a new Zone.
+            NEW_ZONE=""
+            while [ -z "$NEW_ZONE" ]; do
+                read -p "Because the region changed, enter a valid Zone for $REGION (e.g., ${REGION}-a): " NEW_ZONE
+            done
+            ZONE="$NEW_ZONE"
+            break
+        else
+            SUBNET_NAME="$SUBNET_ACTION"
+            echo "Selected Subnet: $SUBNET_NAME"
+            break
+        fi
+    else
+        echo "Invalid selection."
+    fi
+done
+
+# 8. Static External IP Logic
+echo -e "\nChecking for available static external IPs in region $REGION..."
+UNUSED_IPS_RAW=$(gcloud compute addresses list --regions="$REGION" --filter="status=RESERVED" --format="csv[no-heading](name,address)" --project="$PROJECT_ID")
+
+IP_NAME="${VM_NAME}-ext-ip"
+
+if [ -n "$UNUSED_IPS_RAW" ]; then
+    readarray -t UNUSED_IPS <<< "$UNUSED_IPS_RAW"
+    echo "Found unused static IPs in region '$REGION'."
+    
+    IP_OPTIONS=()
+    for ip_entry in "${UNUSED_IPS[@]}"; do
+        if [ -n "$ip_entry" ]; then
+            IP_N=$(echo "$ip_entry" | cut -d',' -f1)
+            IP_A=$(echo "$ip_entry" | cut -d',' -f2)
+            IP_OPTIONS+=("$IP_N ($IP_A)")
+        fi
+    done
+    IP_OPTIONS+=("Create a NEW static IP")
+
+    echo "Please select an IP address to use:"
+    select IP_CHOICE in "${IP_OPTIONS[@]}"; do
+        if [ -n "$IP_CHOICE" ]; then
+            if [[ "$IP_CHOICE" == *"Create a NEW static IP"* ]]; then
+                echo -e "\nReserving new static external IP '$IP_NAME'..."
+                if ! gcloud compute addresses describe "$IP_NAME" --region="$REGION" --project="$PROJECT_ID" &>/dev/null; then
+                    gcloud compute addresses create "$IP_NAME" --region="$REGION" --project="$PROJECT_ID"
+                fi
+                STATIC_IP=$(gcloud compute addresses describe "$IP_NAME" --region="$REGION" --format="value(address)" --project="$PROJECT_ID")
+                break
+            else
+                IP_NAME=$(echo "$IP_CHOICE" | awk '{print $1}')
+                STATIC_IP=$(echo "$IP_CHOICE" | awk '{print $2}' | tr -d '()')
+                echo "Using existing static IP: $STATIC_IP"
+                break
+            fi
+        else
+            echo "Invalid selection. Please enter a valid number."
+        fi
+    done
+else
+    echo "No unused static IPs found. Reserving a new one '$IP_NAME'..."
+    if ! gcloud compute addresses describe "$IP_NAME" --region="$REGION" --project="$PROJECT_ID" &>/dev/null; then
+        gcloud compute addresses create "$IP_NAME" --region="$REGION" --project="$PROJECT_ID"
+    fi
+    STATIC_IP=$(gcloud compute addresses describe "$IP_NAME" --region="$REGION" --format="value(address)" --project="$PROJECT_ID")
+fi
+echo "Assigned IP: $STATIC_IP"
+
+# 9. Firewall Rules
+echo -e "\nEnsuring firewall rules exist for ICMP, HTTP, HTTPS, and CRD on network '$NETWORK_NAME'..."
+FW_RULE_NAME="allow-web-crd-${NETWORK_NAME}"
+
+if ! gcloud compute firewall-rules describe "$FW_RULE_NAME" --project="$PROJECT_ID" &>/dev/null; then
+    gcloud compute firewall-rules create "$FW_RULE_NAME" \
+        --project="$PROJECT_ID" \
+        --network="$NETWORK_NAME" \
+        --allow=icmp,tcp:80,tcp:443,tcp:3389 \
+        --direction=INGRESS \
+        --target-tags=allow-common,http-server,https-server,crd-enabled
+else
+    echo "Firewall rule '$FW_RULE_NAME' already exists."
+fi
+
+# 10. Create the VM
+echo -e "\nCreating VM instance $VM_NAME..."
+gcloud compute instances create "$VM_NAME" \
+    --project="$PROJECT_ID" \
+    --zone="$ZONE" \
+    --machine-type="$MACHINE_TYPE" \
+    --network-interface=network-tier=PREMIUM,stack-type=IPV4_ONLY,subnet="$SUBNET_NAME",nic-type=GVNIC,address="$STATIC_IP" \
+    --maintenance-policy=TERMINATE \
+    --service-account="$SERVICE_ACCOUNT" \
+    --scopes=https://www.googleapis.com/auth/cloud-platform \
+    $ACCEL_FLAG \
+    --tags=allow-common,http-server,https-server,crd-enabled \
+    --create-disk=auto-delete=yes,boot=yes,device-name="$VM_NAME",image=projects/ubuntu-os-cloud/global/images/ubuntu-2404-noble-amd64-v20240423,mode=rw,size=100,type=pd-standard \
+    --no-shielded-secure-boot \
+    --shielded-vtpm \
+    --shielded-integrity-monitoring \
+    --metadata=enable-osconfig=true,enable-oslogin=FALSE \
+    --labels=goog-terraform-provisioned=true \
+    --reservation-affinity=any
+
+echo -e "\n======================================================"
+echo "  VM Provisioning Complete!"
+echo "  VM Name:     $VM_NAME"
+echo "  Zone:        $ZONE"
+echo "  Network:     $NETWORK_NAME"
+echo "  Subnet:      $SUBNET_NAME"
+echo "  External IP: $STATIC_IP ($IP_NAME)"
+echo "  Accelerator: ${ACCEL_TYPE:-None}"
+echo "======================================================"
